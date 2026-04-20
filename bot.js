@@ -19,11 +19,11 @@
  *   BURN_AMOUNT        DAC dibakar per siklus (default: 0.005)
  *   PORT               port ping server (default: 3000)
  *
- *   USE_PROXY          true / false — baca dari proxy.txt di direktori yang sama
+ *   (Proxy tidak lagi dari file. Input langsung via Telegram bot tombol "Kelola Proxy")
  *
  * CATATAN:
  *   - Private key tidak lagi dari env. Semua diinput via Telegram bot.
- *   - Proxy dibaca dari file proxy.txt (satu proxy per baris, format ip:port)
+ *   - Proxy diinput via Telegram bot (tombol "Kelola Proxy"), disimpan di sessions.json
  *   - Alamat tujuan TX diambil random dari Discord channel
  */
 
@@ -51,7 +51,6 @@ http.createServer((req, res) => {
 
 const STATE_FILE    = path.join(__dirname, 'state.json');
 const LOG_FILE      = path.join(__dirname, 'bot.log');
-const PROXY_FILE    = path.join(__dirname, 'proxy.txt');
 const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
 
 const OWNER_CHAT_ID      = 6469077855;
@@ -77,7 +76,8 @@ const LOOP_MS      = LOOP_MINUTES * 60 * 1000;
 const DAILY_TX     = parseInt(process.env.DAILY_TX     || '50', 10);
 const BURN_AMOUNT  = process.env.BURN_AMOUNT            || '0.005';
 const PARALLEL     = Math.min(parseInt(process.env.PARALLEL || '5', 10), 30);
-const USE_PROXY    = (process.env.USE_PROXY || 'false').toLowerCase() === 'true';
+// USE_PROXY otomatis aktif kalau proxyPool.list terisi (via Telegram)
+function isProxyActive() { return proxyPool.list.length > 0; }
 
 const CYCLES_PER_DAY = Math.floor((24 * 60) / LOOP_MINUTES);
 const TX_PER_CYCLE   = Math.max(1, Math.ceil(DAILY_TX / CYCLES_PER_DAY));
@@ -136,6 +136,11 @@ function loadSessions() {
     if (data.dailySummary && typeof data.dailySummary === 'object') {
       dailySummary = data.dailySummary;
     }
+    // Load proxy yang sudah disimpan sebelumnya
+    if (Array.isArray(data.proxies) && data.proxies.length > 0) {
+      proxyPool.list = data.proxies;
+      log('ok', '', `Loaded ${proxyPool.list.length} proxy dari sessions.json`);
+    }
   } catch (_) {
     log('info', '', 'sessions.json belum ada, mulai fresh');
   }
@@ -147,6 +152,7 @@ function saveSessions() {
       subscribers:  [...subscribers],
       privateKeys,
       dailySummary,
+      proxies: proxyPool.list,   // simpan proxy list
     }, null, 2));
   } catch (e) {
     log('error', '', `Gagal save sessions: ${e.message}`);
@@ -154,56 +160,46 @@ function saveSessions() {
 }
 
 // ============================================================================
-//  PROXY MANAGER  — baca dari proxy.txt
+//  PROXY MANAGER  — diinput via Telegram bot
 // ============================================================================
 
 const proxyPool = { list: [] };
 
-function loadProxyFile() {
-  if (!USE_PROXY) return;
-  if (!fs.existsSync(PROXY_FILE)) {
-    log('warn', '', `proxy.txt tidak ditemukan di: ${PROXY_FILE}`);
-    return;
+/**
+ * Parse teks proxy (satu per baris) dan simpan ke proxyPool.
+ * Format yang didukung: ip:port | http://ip:port | user:pass@host:port
+ * Kembalikan jumlah proxy valid.
+ */
+function setProxyList(rawText) {
+  const lines = rawText
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l && !l.startsWith('#'));
+
+  const parsed = lines.map(l => {
+    if (l.startsWith('http://') || l.startsWith('https://')) return l;
+    if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(l)) return `http://${l}`;
+    if (l.includes('@')) return `http://${l}`;
+    return null;
+  }).filter(Boolean);
+
+  // shuffle
+  for (let i = parsed.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [parsed[i], parsed[j]] = [parsed[j], parsed[i]];
   }
-  try {
-    const lines = fs.readFileSync(PROXY_FILE, 'utf8')
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l && !l.startsWith('#'));
 
-    const parsed = lines.map(l => {
-      if (l.startsWith('http://') || l.startsWith('https://')) return l;
-      if (/^\d{1,3}(\.\d{1,3}){3}:\d+$/.test(l)) return `http://${l}`;
-      // format user:pass@host:port
-      if (l.includes('@')) return `http://${l}`;
-      return null;
-    }).filter(Boolean);
-
-    if (parsed.length === 0) {
-      log('warn', '', 'proxy.txt ada tapi tidak ada entry yang valid (format: ip:port)');
-      return;
-    }
-
-    // shuffle
-    for (let i = parsed.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [parsed[i], parsed[j]] = [parsed[j], parsed[i]];
-    }
-
-    proxyPool.list = parsed;
-    log('ok', '', `proxy.txt loaded: ${proxyPool.list.length} proxies`);
-  } catch (e) {
-    log('error', '', `Gagal baca proxy.txt: ${e.message}`);
-  }
+  proxyPool.list = parsed;
+  return parsed.length;
 }
 
 function getProxyUrl(walletIndex) {
-  if (!USE_PROXY || proxyPool.list.length === 0) return null;
+  if (!isProxyActive()) return null;
   return proxyPool.list[walletIndex % proxyPool.list.length];
 }
 
 function getNextProxyUrl(currentIndex) {
-  if (!USE_PROXY || proxyPool.list.length === 0) return null;
+  if (!isProxyActive()) return null;
   return proxyPool.list[(currentIndex + 1) % proxyPool.list.length];
 }
 
@@ -659,7 +655,7 @@ async function runWallet(pk, walletIndex) {
   const now    = Date.now();
 
   let proxyUrl = getProxyUrl(walletIndex);
-  if (USE_PROXY) {
+  if (isProxyActive()) {
     log('info', addr, `Proxy: ${proxyUrl || 'tidak ada proxy tersedia'}`);
   }
 
@@ -679,7 +675,7 @@ async function runWallet(pk, walletIndex) {
       authOk = true;
       break;
     } catch (e) {
-      if (USE_PROXY && attempt < 2) {
+      if (isProxyActive() && attempt < 2) {
         const np = getNextProxyUrl(walletIndex + attempt);
         log('warn', addr, `Auth gagal (attempt ${attempt + 1}/3), rotate proxy → ${np}`);
         api.http = createHttpClient(CFG.api, np);
@@ -756,13 +752,15 @@ function ownerMenu(running) {
   return {
     inline_keyboard: running
       ? [
-          [{ text: '⛔ Stop Bot',           callback_data: 'stop'     }],
-          [{ text: '➕ Tambah Private Key', callback_data: 'add_keys' }],
-          [{ text: '📊 Lihat Summary',      callback_data: 'summary'  }],
+          [{ text: '⛔ Stop Bot',           callback_data: 'stop'      }],
+          [{ text: '➕ Tambah Private Key', callback_data: 'add_keys'  }],
+          [{ text: '🔀 Kelola Proxy',       callback_data: 'set_proxy' }],
+          [{ text: '📊 Lihat Summary',      callback_data: 'summary'   }],
         ]
       : [
           [{ text: '🚀 Start Bot',           callback_data: 'start_bot' }],
           [{ text: '➕ Tambah Private Key',  callback_data: 'add_keys'  }],
+          [{ text: '🔀 Kelola Proxy',        callback_data: 'set_proxy' }],
           [{ text: '📊 Lihat Summary',       callback_data: 'summary'   }],
         ],
   };
@@ -829,7 +827,7 @@ function initTelegramBot() {
       `Status: ${botRunning ? '🟢 Running' : '🔴 Stopped'}`,
       `Wallet: *${privateKeys.length}*`,
       `Discord addrs: *${discordAddresses.length}*`,
-      `Proxy: *${USE_PROXY ? proxyPool.list.length + ' proxies' : 'nonaktif'}*`,
+      `Proxy: *${isProxyActive() ? proxyPool.list.length + ' proxies aktif' : 'nonaktif'}*`,
       `Subscribers: *${subscribers.size}*\n`,
     ];
 
@@ -852,6 +850,28 @@ function initTelegramBot() {
 
     const session = userSessions[chatId];
     if (!session) return;
+
+    // State: menunggu proxy list (paste semua sekaligus)
+    if (session.state === 'awaiting_proxy') {
+      const count = setProxyList(text);
+      if (count === 0) {
+        await bot.sendMessage(chatId,
+          `❌ Tidak ada proxy valid ditemukan.\n\nFormat yang didukung (satu per baris):\n` +
+          "`ip:port`\n`http://ip:port`\n`user:pass@host:port`",
+          { parse_mode: 'Markdown' }
+        );
+        return;
+      }
+      saveSessions();
+      delete userSessions[chatId];
+      log('ok', '', `${count} proxy disimpan oleh owner via Telegram`);
+      await bot.sendMessage(chatId,
+        `✅ *${count} proxy* berhasil disimpan dan diaktifkan!\n\n` +
+        `Proxy akan digunakan di cycle berikutnya.`,
+        { parse_mode: 'Markdown', reply_markup: ownerMenu(botRunning) }
+      );
+      return;
+    }
 
     // State: menunggu jumlah key
     if (session.state === 'awaiting_count') {
@@ -954,7 +974,7 @@ function initTelegramBot() {
         `💼 ${privateKeys.length} wallet aktif\n` +
         `🔄 Loop setiap ${LOOP_MINUTES} menit\n` +
         `📡 Discord scrape: ${discordAddresses.length} alamat\n` +
-        `🔀 Proxy: ${USE_PROXY ? proxyPool.list.length + ' proxies' : 'nonaktif'}`,
+        `🔀 Proxy: ${isProxyActive() ? proxyPool.list.length + ' proxies' : 'nonaktif'}`,
         { parse_mode: 'Markdown', reply_markup: ownerMenu(true) }
       );
 
@@ -1003,6 +1023,50 @@ function initTelegramBot() {
       await bot.sendMessage(chatId, text, { parse_mode: 'Markdown' });
       return;
     }
+
+    // ─ SET PROXY ─
+    if (data === 'set_proxy') {
+      const current = proxyPool.list.length;
+      userSessions[chatId] = { state: 'awaiting_proxy' };
+      await bot.sendMessage(chatId,
+        `🔀 *Kelola Proxy*\n\n` +
+        `Proxy aktif sekarang: *${current}*\n\n` +
+        `Paste semua proxy kamu dalam *satu pesan*, satu per baris:\n\n` +
+        `Format yang didukung:\n` +
+        `\`ip:port\`\n\`http://ip:port\`\n\`user:pass@host:port\`\n\n` +
+        `_(Kirim proxy baru akan menggantikan semua proxy lama)_`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '🗑 Hapus Semua Proxy', callback_data: 'clear_proxy' }],
+              [{ text: '❌ Batal',             callback_data: 'cancel_proxy' }],
+            ],
+          },
+        }
+      );
+      return;
+    }
+
+    // ─ CLEAR PROXY ─
+    if (data === 'clear_proxy') {
+      proxyPool.list = [];
+      saveSessions();
+      delete userSessions[chatId];
+      log('ok', '', 'Semua proxy dihapus oleh owner');
+      await bot.sendMessage(chatId,
+        `🗑 *Semua proxy dihapus.*\nBot sekarang berjalan tanpa proxy.`,
+        { parse_mode: 'Markdown', reply_markup: ownerMenu(botRunning) }
+      );
+      return;
+    }
+
+    // ─ CANCEL PROXY ─
+    if (data === 'cancel_proxy') {
+      delete userSessions[chatId];
+      await bot.sendMessage(chatId, '↩️ Dibatalkan.', { reply_markup: ownerMenu(botRunning) });
+      return;
+    }
   });
 
   bot.on('polling_error', (err) => {
@@ -1032,9 +1096,6 @@ async function runBotLoop(bot) {
   log('info', '', `Bot loop start — ${privateKeys.length} wallets, loop ${LOOP_MINUTES}m`);
 
   while (botRunning && !botStopFlag) {
-    // Reload proxy setiap cycle (kalau file berubah)
-    if (USE_PROXY) loadProxyFile();
-
     await runAll(privateKeys);
     saveSessions();
 
@@ -1094,14 +1155,35 @@ async function runBotLoop(bot) {
   console.log('  https://inception.dachain.io/activity');
   console.log('======================================================\n');
 
+  // ── Fetch IP publik Railway (untuk didaftarkan ke IP auth ProxyScrape) ──
+  let publicIp = 'tidak diketahui';
+  try {
+    const ipRes = await axios.get('https://api.ipify.org?format=json', { timeout: 8000 });
+    publicIp = ipRes.data?.ip || 'tidak diketahui';
+  } catch (_) {
+    try {
+      const ipRes2 = await axios.get('https://ifconfig.me/ip', { timeout: 8000 });
+      publicIp = (ipRes2.data || '').trim() || 'tidak diketahui';
+    } catch (_2) {}
+  }
+  log('info', '', `═══ IP PUBLIK SERVER (Railway): ${publicIp} ═══`);
+  console.log(`\n  ► IP untuk ProxyScrape IP Auth: ${publicIp}\n`);
+
   // Load state tersimpan
   loadSessions();
 
-  // Load proxy
-  if (USE_PROXY) loadProxyFile();
-
   // Inisialisasi Telegram bot
   const bot = initTelegramBot();
+
+  // Kirim IP ke owner via Telegram (supaya gampang copy)
+  try {
+    await bot.sendMessage(OWNER_CHAT_ID,
+      `🖥 *Server Railway aktif!*\n\n` +
+      `📡 IP Publik: \`${publicIp}\`\n\n` +
+      `_Daftarkan IP ini ke ProxyScrape IP Auth jika diperlukan._`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (_) {}
 
   // Jadwalkan daily summary
   scheduleDailySummary(bot);
@@ -1110,7 +1192,7 @@ async function runBotLoop(bot) {
   console.log(`Owner Chat ID  : ${OWNER_CHAT_ID}`);
   console.log(`Wallet saved   : ${privateKeys.length}`);
   console.log(`Subscribers    : ${subscribers.size}`);
-  console.log(`Proxy          : ${USE_PROXY ? `aktif (${proxyPool.list.length} dari proxy.txt)` : 'nonaktif'}`);
+  console.log(`Proxy          : ${isProxyActive() ? `aktif (${proxyPool.list.length} proxies)` : 'nonaktif (input via Telegram)'}`);
   console.log(`Discord CH     : ${DISCORD_CHANNEL_ID}\n`);
 
   if (privateKeys.length > 0) {
