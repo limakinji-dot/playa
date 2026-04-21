@@ -422,12 +422,14 @@ class ApiClient {
     return r.data;
   }
 
-  profile()      { return this.get('/api/inception/profile/'); }
-  faucetClaim()  { return this.post('/api/inception/faucet/'); }
-  crateOpen()    { return this.post('/api/inception/crate/open/', {}); }
-  crateHistory() { return this.get('/api/inception/crate/history/'); }
-  confirmBurn(h) { return this.post('/api/inception/exchange/confirm-burn/', { tx_hash: h }); }
-  sync(h)        { return this.post('/api/inception/sync/', { tx_hash: h || '0x' }); }
+  profile()              { return this.get('/api/inception/profile/'); }
+  faucetClaim()          { return this.post('/api/inception/faucet/'); }
+  faucetHistory()        { return this.get('/api/inception/faucet-history/'); }
+  faucetStatus(id)       { return this.get(`/api/inception/faucet/status/${id}/`); }
+  crateOpen()            { return this.post('/api/inception/crate/open/', {}); }
+  crateHistory()         { return this.get('/api/inception/crate/history/'); }
+  confirmBurn(h)         { return this.post('/api/inception/exchange/confirm-burn/', { tx_hash: h }); }
+  sync(h)                { return this.post('/api/inception/sync/', { tx_hash: h || '0x' }); }
 }
 
 // ============================================================================
@@ -511,19 +513,70 @@ function scheduleDailySummary(bot) {
 
 async function claimFaucet(api, addr, st, now) {
   initSummary(addr);
-  const elapsed = now - st.lastFaucet;
-  if (elapsed < CFG.faucetCd) {
-    const h = Math.floor((CFG.faucetCd - elapsed) / 3_600_000);
-    const m = Math.floor(((CFG.faucetCd - elapsed) % 3_600_000) / 60_000);
-    log('info', addr, `Faucet cooldown — ${h}h ${m}m lagi`);
-    return;
+
+  // Cek cooldown via profile API (lebih akurat daripada tracking lokal)
+  try {
+    const prof = await api.profile();
+    const faucetAvailable = prof?.faucet_available;
+    const cooldownSeconds = prof?.faucet_cooldown_seconds ?? prof?.faucet_seconds_left ?? null;
+
+    if (faucetAvailable === false) {
+      if (cooldownSeconds !== null && cooldownSeconds > 0) {
+        const h = Math.floor(cooldownSeconds / 3600);
+        const m = Math.floor((cooldownSeconds % 3600) / 60);
+        log('info', addr, `Faucet cooldown (server) — ${h}h ${m}m lagi`);
+      } else {
+        const elapsed = now - st.lastFaucet;
+        if (elapsed < CFG.faucetCd) {
+          const h = Math.floor((CFG.faucetCd - elapsed) / 3_600_000);
+          const m = Math.floor(((CFG.faucetCd - elapsed) % 3_600_000) / 60_000);
+          log('info', addr, `Faucet cooldown (lokal) — ${h}h ${m}m lagi`);
+        }
+      }
+      return;
+    }
+  } catch (e) {
+    // Jika profile gagal, fallback ke tracking lokal
+    const elapsed = now - st.lastFaucet;
+    if (elapsed < CFG.faucetCd) {
+      const h = Math.floor((CFG.faucetCd - elapsed) / 3_600_000);
+      const m = Math.floor(((CFG.faucetCd - elapsed) % 3_600_000) / 60_000);
+      log('info', addr, `Faucet cooldown (lokal fallback) — ${h}h ${m}m lagi`);
+      return;
+    }
+    log('warn', addr, `Gagal cek faucet via profile: ${e.message}`);
   }
+
   try {
     const r = await api.faucetClaim();
-    if (r?.success || r?.tx_hash) {
+
+    // Sukses: bisa success:true, tx_hash, dispense_id, atau queued:true
+    const claimed = r?.success || r?.tx_hash || r?.dispense_id || r?.queued;
+    if (claimed) {
       st.lastFaucet = now;
       dailySummary[addr].faucetClaims++;
-      log('ok', addr, `Faucet claimed — amount: ${r.dacc_amount || r.amount || 'n/a'}`);
+
+      // Coba fetch amount dari faucet-history (cara yang benar)
+      let amountStr = r.dacc_amount || r.amount || null;
+      if (!amountStr) {
+        try {
+          await sleep(1500); // tunggu server proses
+          if (r.dispense_id) {
+            const statusR = await api.faucetStatus(r.dispense_id);
+            amountStr = statusR?.amount || statusR?.dacc_amount || null;
+          }
+          if (!amountStr) {
+            const hist = await api.faucetHistory();
+            const entries = Array.isArray(hist) ? hist : (hist?.results || hist?.history || []);
+            if (entries.length > 0) {
+              const latest = entries[0];
+              amountStr = latest?.amount || latest?.dacc_amount || latest?.value || null;
+            }
+          }
+        } catch (_) {}
+      }
+
+      log('ok', addr, `Faucet claimed — amount: ${amountStr || 'n/a'}`);
     } else {
       log('warn', addr, `Faucet: ${r?.error || r?.reason || JSON.stringify(r)}`);
     }
@@ -531,6 +584,8 @@ async function claimFaucet(api, addr, st, now) {
     const d = e.response?.data;
     if (d?.error?.includes('Link') || d?.error?.includes('activate')) {
       log('warn', addr, 'Faucet: link X atau Discord dulu di inception.dachain.io');
+    } else if (d?.error?.includes('cooldown') || d?.error?.includes('wait')) {
+      log('info', addr, `Faucet masih cooldown: ${d.error}`);
     } else {
       log('error', addr, `Faucet failed: ${d?.error || d?.reason || e.message}`);
     }
@@ -708,9 +763,11 @@ async function runWallet(pk, walletIndex) {
 
   try {
     const p = await api.profile();
+    const dacc = p.dacc_balance ?? p.dacc ?? 'n/a';
     log('ok', addr,
-      `Profile — QE: ${p.qe_balance} | Rank: #${p.user_rank} | Badges: ${p.badges?.length || 0}` +
-      ` | Streak: ${p.streak_days}d | TX: ${p.tx_count} | x${p.qe_multiplier}`
+      `Profile — QE: ${p.qe_balance ?? 'n/a'} | DACC: ${dacc} | Rank: #${p.user_rank ?? '?'}` +
+      ` | Badges: ${p.badges?.length ?? p.badges_count ?? 0}` +
+      ` | Streak: ${p.streak_days ?? 0}d | TX: ${p.tx_count ?? 0} | x${p.qe_multiplier ?? 1}`
     );
   } catch (_) {}
 
