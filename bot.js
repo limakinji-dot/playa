@@ -64,7 +64,7 @@ const CFG = {
   api:          'https://inception.dachain.io',
   qeContract:   '0x3691A78bE270dB1f3b1a86177A8f23F89A8Cef24',
   qeAbi:        ['function burnForQE() payable'],
-  faucetCd:     8 * 60 * 60 * 1000,
+  faucetCd:     24 * 60 * 60 * 1000,
   crateCd:      24 * 60 * 60 * 1000,
   sendAmount:   '0.001',
   txDelay:      3000,
@@ -306,7 +306,7 @@ function saveState(state) {
 function getWalletState(all, addr) {
   if (!all[addr]) {
     all[addr] = {
-      lastFaucet: 0, lastCrate: 0, txCount: 0,
+      lastFaucet: 0, txCount: 0,
       txToday: 0, txDayStart: 0, crateOpens: 0, cycles: 0,
     };
   }
@@ -424,7 +424,8 @@ class ApiClient {
 
   profile()      { return this.get('/api/inception/profile/'); }
   faucetClaim()  { return this.post('/api/inception/faucet/'); }
-  crateOpen()    { return this.post('/api/inception/crate/open/', { crate_name: 'daily' }); }
+  crateOpen()    { return this.post('/api/inception/crate/open/', {}); }
+  crateHistory() { return this.get('/api/inception/crate/history/'); }
   confirmBurn(h) { return this.post('/api/inception/exchange/confirm-burn/', { tx_hash: h }); }
   sync(h)        { return this.post('/api/inception/sync/', { tx_hash: h || '0x' }); }
 }
@@ -536,31 +537,38 @@ async function claimFaucet(api, addr, st, now) {
   }
 }
 
-async function openCrate(api, addr, st, now) {
+async function openCrates(api, addr, st) {
   initSummary(addr);
-  if (now - st.lastCrate < CFG.crateCd) {
-    const h = Math.round((CFG.crateCd - (now - st.lastCrate)) / 3_600_000);
-    log('info', addr, `Crate cooldown — ${h}h lagi`);
-    return;
-  }
   try {
-    const r = await api.crateOpen();
-    if (r?.success) {
-      st.lastCrate = now;
+    const history     = await api.crateHistory();
+    const opensToday  = history.opens_today      || 0;
+    const dailyLimit  = history.daily_open_limit || 5;
+    const remaining   = Math.max(dailyLimit - opensToday, 0);
+
+    if (remaining <= 0) {
+      log('info', addr, `Crate: ${opensToday}/${dailyLimit} sudah dibuka hari ini`);
+      return;
+    }
+
+    log('info', addr, `Crate: membuka ${remaining} crate (${opensToday}/${dailyLimit} sudah dibuka)`);
+
+    for (let i = 0; i < remaining; i++) {
+      if (botStopFlag) break;
+      const r = await api.crateOpen();
+      if (!r?.success) {
+        log('warn', addr, `Crate ${i + 1}: ${r?.error || JSON.stringify(r)}`);
+        break;
+      }
       st.crateOpens++;
       dailySummary[addr].crateOpens++;
-      log('ok', addr, `Crate #${st.crateOpens} opened — reward: ${r.reward?.label || 'n/a'} | QE: ${r.new_total_qe}`);
-    } else {
-      log('warn', addr, `Crate: ${r?.error || JSON.stringify(r)}`);
+      log('ok', addr,
+        `Crate #${st.crateOpens} opened — reward: ${r.reward?.label || 'n/a'} (+${r.reward?.amount || 0} QE) | QE: ${r.new_total_qe}`
+      );
+      await sleep(1000);
     }
   } catch (e) {
     const d = e.response?.data;
-    if (d?.error?.includes('limit') || d?.error?.includes('cooldown')) {
-      st.lastCrate = now;
-      log('info', addr, 'Crate daily limit reached');
-    } else {
-      log('error', addr, `Crate failed: ${d?.error || e.message}`);
-    }
+    log('error', addr, `Crate failed: ${d?.error || e.message}`);
   }
 }
 
@@ -692,7 +700,7 @@ async function runWallet(pk, walletIndex) {
   } catch (_) {}
 
   await claimFaucet(api, addr, st, now);  await sleep(1000);
-  await openCrate(api, addr, st, now);    await sleep(1000);
+  await openCrates(api, addr, st);         await sleep(1000);
   await sendTxs(signer, api, addr, st, now); await sleep(1000);
   await burnForQE(signer, api, addr);    await sleep(1000);
 
