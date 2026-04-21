@@ -520,21 +520,26 @@ async function claimFaucet(api, addr, st, now) {
     const faucetAvailable = prof?.faucet_available;
     const cooldownSeconds = prof?.faucet_cooldown_seconds ?? prof?.faucet_seconds_left ?? null;
 
+    // Debug: selalu log status faucet dari server
+    log('info', addr,
+      `Faucet status — available: ${faucetAvailable} | cooldown: ${cooldownSeconds}s` +
+      ` | dacc: ${prof?.dacc_balance ?? 'n/a'}`
+    );
+
     if (faucetAvailable === false) {
       if (cooldownSeconds !== null && cooldownSeconds > 0) {
         const h = Math.floor(cooldownSeconds / 3600);
         const m = Math.floor((cooldownSeconds % 3600) / 60);
         log('info', addr, `Faucet cooldown (server) — ${h}h ${m}m lagi`);
-      } else {
-        const elapsed = now - st.lastFaucet;
-        if (elapsed < CFG.faucetCd) {
-          const h = Math.floor((CFG.faucetCd - elapsed) / 3_600_000);
-          const m = Math.floor(((CFG.faucetCd - elapsed) % 3_600_000) / 60_000);
-          log('info', addr, `Faucet cooldown (lokal) — ${h}h ${m}m lagi`);
-        }
+        return;
       }
-      return;
+      // faucet_available=false tapi cooldown=0/null → server mungkin sedang proses, tetap coba
+      log('warn', addr, 'Faucet: available=false tapi cooldown tidak jelas, tetap coba claim...');
+    } else if (faucetAvailable === null || faucetAvailable === undefined) {
+      // Field tidak ada di response, langsung coba claim
+      log('warn', addr, 'Faucet: field faucet_available tidak ada di profile, langsung coba claim');
     }
+    // faucetAvailable === true → lanjut claim (fall through)
   } catch (e) {
     // Jika profile gagal, fallback ke tracking lokal
     const elapsed = now - st.lastFaucet;
@@ -544,7 +549,7 @@ async function claimFaucet(api, addr, st, now) {
       log('info', addr, `Faucet cooldown (lokal fallback) — ${h}h ${m}m lagi`);
       return;
     }
-    log('warn', addr, `Gagal cek faucet via profile: ${e.message}`);
+    log('warn', addr, `Gagal cek faucet via profile: ${e.message} — tetap coba claim`);
   }
 
   try {
