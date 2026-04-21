@@ -410,16 +410,37 @@ class ApiClient {
     return r.data;
   }
 
+  async _requestWithRetry(method, endpoint, body) {
+    const doRequest = () => method === 'get'
+      ? this.http.get(endpoint, { headers: this._headers() })
+      : this.http.post(endpoint, body, { headers: this._headers(true) });
+
+    try {
+      const r = await doRequest();
+      this._saveCookies(r);
+      return r.data;
+    } catch (e) {
+      // Auto re-auth kalau 401 (session expired)
+      if (e.response?.status === 401) {
+        try {
+          await this.init();
+          const r2 = await doRequest();
+          this._saveCookies(r2);
+          return r2.data;
+        } catch (e2) {
+          throw e2;
+        }
+      }
+      throw e;
+    }
+  }
+
   async get(endpoint) {
-    const r = await this.http.get(endpoint, { headers: this._headers() });
-    this._saveCookies(r);
-    return r.data;
+    return this._requestWithRetry('get', endpoint);
   }
 
   async post(endpoint, body = {}) {
-    const r = await this.http.post(endpoint, body, { headers: this._headers(true) });
-    this._saveCookies(r);
-    return r.data;
+    return this._requestWithRetry('post', endpoint, body);
   }
 
   profile()              { return this.get('/api/inception/profile/'); }
